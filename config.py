@@ -75,19 +75,21 @@ MI_SAMPLE_PER_CLASS = 50_000         # class-balanced sample for MI
 # ----------------------------------------------------------------------
 # Training
 # ----------------------------------------------------------------------
-BATCH_SIZE = 512
+BATCH_SIZE = int(os.environ.get("IDS_BATCH", 1024))   # T4 16 GB: larger batches keep the GPU busier
 EPOCHS = int(os.environ.get("IDS_EPOCHS", 50))
 LEARNING_RATE = 1e-3
 SEED = 42
 FOCAL_GAMMA = 2.0
 USE_FOCAL_LOSS = True                # legacy flag; --loss overrides
-MAX_TRAIN_WINDOWS = 3_000_000
-MAX_EVAL_WINDOWS = 500_000
+MAX_TRAIN_WINDOWS = int(os.environ.get("IDS_MAX_TRAIN", 3_000_000))   # run_all.sh lowers this to fit the time budget
+MAX_EVAL_WINDOWS = int(os.environ.get("IDS_MAX_EVAL", 500_000))
 
 # Window-level SMOTE (05_train.py --balance smote)
+PATIENCE = int(os.environ.get("IDS_PATIENCE", 6))        # early-stopping patience (epochs)
+GBM_MAX_TRAIN = int(os.environ.get("IDS_GBM_MAX", 1_000_000))   # windows used to fit the window-stats GBM
 SMOTE_TARGET_FRAC = 0.5      # minority classes grown to this share of the majority count
-SMOTE_SOURCE_CAP = 30_000    # real minority windows fed to SMOTE (neighbour search is O(n^2))
-SMOTE_MAJOR_CAP = 400_000    # benign windows kept in the SMOTE set (RAM)
+SMOTE_SOURCE_CAP = int(os.environ.get("IDS_SMOTE_SRC", 30_000))    # real minority windows fed to SMOTE (neighbour search is O(n^2))
+SMOTE_MAJOR_CAP = int(os.environ.get("IDS_SMOTE_MAJ", 400_000))    # benign windows kept in the SMOTE set (RAM)
 
 # ----------------------------------------------------------------------
 # Legacy names, kept so old scripts (06_eval.py, serve/app.py) still import
@@ -97,3 +99,6 @@ PRE_ATTACK_FRACTION = 0.0
 PRE_ATTACK_MAX_FLOWS = 0
 LEAK_COLUMNS = ["Flow ID", "Src IP", "Src Port", "Dst IP", "Timestamp", "Label",
                 "__y", "__blk", "__split"]
+
+# CSV reading: rows per chunk (smaller = less RAM; run_all.py lowers it after a memory failure)
+CHUNK_ROWS = int(os.environ.get("IDS_CHUNK_ROWS", 200_000))

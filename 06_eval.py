@@ -26,6 +26,7 @@ from sklearn.metrics import (classification_report, confusion_matrix, roc_curve,
 from sklearn.preprocessing import label_binarize
 
 import config as C
+import models  # noqa: F401  (registers AttentionPool for load_model)
 
 FIG = C.ARTIFACT_DIR / "figures"; FIG.mkdir(exist_ok=True)
 RES = C.ARTIFACT_DIR / "results"; RES.mkdir(exist_ok=True)

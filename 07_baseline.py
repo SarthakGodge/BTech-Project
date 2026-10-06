@@ -61,12 +61,13 @@ def main():
         va = rng.choice(va, C.MAX_EVAL_WINDOWS, replace=False)
     cnt = np.bincount(y[keep], minlength=3).astype(float)
     w_cls = np.sqrt(cnt.sum() / (3 * np.maximum(cnt, 1)))               # softened balanced
-    model = lgb.LGBMClassifier(objective="multiclass", num_class=3, n_estimators=600,
+    model = lgb.LGBMClassifier(n_estimators=600,       # objective auto: binary / multiclass
                                learning_rate=0.05, num_leaves=63, subsample=0.8,
                                subsample_freq=1, colsample_bytree=0.8,
                                random_state=args.seed, n_jobs=-1, verbose=-1)
     model.fit(X[keep], y[keep], sample_weight=w_cls[y[keep]],
-              eval_set=[(X[va], y[va])],
+              eval_set=[(X[va][np.isin(y[va], np.unique(y[keep]))],
+                         y[va][np.isin(y[va], np.unique(y[keep]))])],
               callbacks=[lgb.early_stopping(30, verbose=False)])
 
     report = {}

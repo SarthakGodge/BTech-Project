@@ -5,6 +5,7 @@ Stage 5 - hybrid CNN + LSTM with selectable imbalance handling.
   python 05_train.py --balance none  --tag none   # baseline, plain CE
   python 05_train.py --balance sampler --tag sampler
   python 05_train.py --balance smote --tag smote
+  python 05_train.py --arch attn --tag attn_s1          # attention BiGRU variant
   python 05_train.py --seq holdout_cic2017 --tag xds   # cross-dataset run
 
 --balance
@@ -20,35 +21,28 @@ accuracy alone is misleading on this data.
 """
 import argparse
 import json
+import sys
 import numpy as np
 import tensorflow as tf
-from sklearn.metrics import classification_report, confusion_matrix, f1_score
 from sklearn.utils.class_weight import compute_class_weight
 
 import config as C
+from models import build_model
+from evalutil import eval_indices, tune_class_scales, make_report
 
 SEED = C.SEED
 
+# Let TensorFlow grow GPU memory on demand instead of grabbing it all (avoids start-up OOM).
+for _g in tf.config.list_physical_devices("GPU"):
+    try:
+        tf.config.experimental.set_memory_growth(_g, True)
+    except Exception:
+        pass
+VERBOSE = 1 if sys.stdout.isatty() else 2        # one line per epoch in log files
+
 
 # ------------------------------------------------------------------ model
-def build_model(timesteps, n_features, n_classes=3):
-    L = tf.keras.layers
-    inp = L.Input(shape=(timesteps, n_features), name="flow_window")
-    x = L.Conv1D(64, 3, padding="same", use_bias=False)(inp)
-    x = L.BatchNormalization()(x)
-    x = L.Activation("relu")(x)
-    x = L.Conv1D(128, 3, padding="same", use_bias=False)(x)
-    x = L.BatchNormalization()(x)
-    x = L.Activation("relu")(x)
-    x = L.MaxPooling1D(2)(x)
-    x = L.Dropout(0.3)(x)
-    x = L.LSTM(128, return_sequences=True)(x)
-    x = L.Dropout(0.3)(x)
-    x = L.LSTM(64)(x)
-    x = L.Dense(64, activation="relu")(x)
-    x = L.Dropout(0.4)(x)
-    out = L.Dense(n_classes, activation="softmax", name="predictions")(x)
-    return tf.keras.Model(inp, out, name="cnn_lstm_ids")
+# build_model lives in models.py (shared with 06_eval.py).
 
 
 def focal_loss(gamma=2.0, class_weights=None):
@@ -156,46 +150,11 @@ def smote_arrays(X, y, parts, rng):
 
 
 # ------------------------------------------------------------------- eval
-def predict_probs(model, X, y, rng):
-    idx = np.arange(len(y))
-    if len(idx) > C.MAX_EVAL_WINDOWS:
-        idx = np.sort(rng.choice(idx, C.MAX_EVAL_WINDOWS, replace=False))
+def predict_probs(model, X, y):
+    idx = eval_indices(len(y))                     # same windows for every model
     if len(idx) == 0:
         return idx, np.zeros((0, 3), dtype=np.float32)
     return idx, model.predict(index_dataset(X, y, idx, False), verbose=0)
-
-
-def tune_class_scales(prob, y):
-    """Multiply class-1/2 probabilities by factors chosen on VAL to maximise macro-F1."""
-    from sklearn.metrics import f1_score
-    grid = [0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 8.0]
-    best, best_f = np.ones(3), f1_score(y, prob.argmax(1), average="macro")
-    for a in grid:
-        for b in grid:
-            sc = np.array([1.0, a, b])
-            f = f1_score(y, (prob * sc).argmax(1), average="macro")
-            if f > best_f + 1e-9:
-                best, best_f = sc, f
-    return best, best_f
-
-
-def make_report(yt, pred, name, out, ds_ids=None):
-    rep = classification_report(yt, pred, labels=[0, 1, 2], target_names=C.CLASS_NAMES,
-                                output_dict=True, zero_division=0)
-    print(f"\n=== {name} ({len(yt):,} windows) ===")
-    print(classification_report(yt, pred, labels=[0, 1, 2], target_names=C.CLASS_NAMES,
-                                zero_division=0, digits=4))
-    print("confusion matrix (rows=true):\n", confusion_matrix(yt, pred, labels=[0, 1, 2]))
-    if ds_ids is not None:
-        names = list(C.DATASET_DIRS)
-        per = {}
-        for k in np.unique(ds_ids):
-            m = ds_ids == k
-            per[names[k] if 0 <= k < len(names) else str(k)] = float(
-                f1_score(yt[m], pred[m], average="macro", labels=[0, 1, 2], zero_division=0))
-        rep["macro_f1_by_dataset"] = per
-        print("macro-F1 by dataset:", {k: round(v, 4) for k, v in per.items()})
-    out[name] = rep
 
 
 # ------------------------------------------------------------------- main
@@ -209,6 +168,8 @@ def main():
     ap.add_argument("--seq", default="", help="sub-folder of SEQ_DIR")
     ap.add_argument("--tag", default="")
     ap.add_argument("--seed", type=int, default=C.SEED)
+    ap.add_argument("--arch", choices=["base", "attn"], default="base",
+                    help="base = CNN+LSTM; attn = multi-scale CNN + BiGRU + attention pooling")
     ap.add_argument("--no-tune", action="store_true", help="skip class-scale tuning on val")
     args = ap.parse_args()
     global SEED
@@ -226,7 +187,7 @@ def main():
     Xva, yva = load_split(seq_dir, "val")
     Xte, yte = load_split(seq_dir, "test")
     print(f"train {Xtr.shape} | val {Xva.shape} | test {Xte.shape} | "
-          f"balance={args.balance} loss={loss_kind}")
+          f"arch={args.arch} balance={args.balance} loss={loss_kind}")
 
     parts = select_train_indices(ytr, rng, keep)
     print("train windows per class:", [len(p) for p in parts])
@@ -260,19 +221,17 @@ def main():
         train_ds = index_dataset(Xtr, ytr, idx, shuffle=True)
         steps = None
 
-    va_idx = np.arange(len(yva))
-    if len(va_idx) > C.MAX_EVAL_WINDOWS:
-        va_idx = np.sort(rng.choice(va_idx, C.MAX_EVAL_WINDOWS, replace=False))
+    va_idx = eval_indices(len(yva))
     val_ds = index_dataset(Xva, yva, va_idx, shuffle=False)
 
-    model = build_model(Xtr.shape[1], Xtr.shape[2])
+    model = build_model(Xtr.shape[1], Xtr.shape[2], args.arch)
     loss = (focal_loss(C.FOCAL_GAMMA, cw) if loss_kind == "focal"
             else tf.keras.losses.SparseCategoricalCrossentropy())
     model.compile(tf.keras.optimizers.Adam(C.LEARNING_RATE), loss=loss,
                   metrics=["accuracy", MacroF1()])
 
     cbs = [
-        tf.keras.callbacks.EarlyStopping(monitor="val_macro_f1", mode="max", patience=6,
+        tf.keras.callbacks.EarlyStopping(monitor="val_macro_f1", mode="max", patience=C.PATIENCE,
                                          restore_best_weights=True, verbose=1),
         tf.keras.callbacks.ReduceLROnPlateau(monitor="val_macro_f1", mode="max",
                                              factor=0.5, patience=3, min_lr=1e-6, verbose=1),
@@ -281,7 +240,7 @@ def main():
                                            save_best_only=True, verbose=1),
         tf.keras.callbacks.CSVLogger(str(C.ARTIFACT_DIR / f"training_log{tag}.csv")),
     ]
-    fit_kw = dict(validation_data=val_ds, epochs=C.EPOCHS, callbacks=cbs, verbose=1)
+    fit_kw = dict(validation_data=val_ds, epochs=C.EPOCHS, callbacks=cbs, verbose=VERBOSE)
     if steps:
         fit_kw["steps_per_epoch"] = steps
     if loss_kind == "ce" and cw:
@@ -291,22 +250,27 @@ def main():
     model.export(str(C.ARTIFACT_DIR / f"saved_model{tag}"))
 
     report = {}
-    va_i, va_p = predict_probs(model, Xva, yva, rng)
-    te_i, te_p = predict_probs(model, Xte, yte, rng)
+    va_i, va_p = predict_probs(model, Xva, yva)
+    te_i, te_p = predict_probs(model, Xte, yte)
     yv, yt = yva[va_i], yte[te_i]
-    dte = None
+    dte = sub = None
     if (seq_dir / "d_test.npy").exists():
         dte = np.load(seq_dir / "d_test.npy")[te_i]
-    make_report(yv, va_p.argmax(1), "val", report)
-    make_report(yt, te_p.argmax(1), "test", report, dte)
+    if (seq_dir / "s_test.npy").exists():
+        sub = np.load(seq_dir / "s_test.npy")[te_i]
+    make_report(yv, va_p.argmax(1), "val", report, proba=va_p)
+    make_report(yt, te_p.argmax(1), "test", report, proba=te_p, ds_ids=dte, sub=sub)
     if not args.no_tune and len(yv):
-        scales, f = tune_class_scales(va_p, yv)          # tuned on VAL only
+        scales, f = tune_class_scales(va_p, yv)          # tuned on VAL only; needs a real gain
         print(f"\nclass scales tuned on val: {scales.tolist()} (val macro-F1 {f:.4f})")
-        make_report(yt, (te_p * scales).argmax(1), "test_tuned", report, dte)
+        make_report(yt, (te_p * scales).argmax(1), "test_tuned", report, proba=te_p * scales,
+                    ds_ids=dte, sub=sub)
         with open(C.ARTIFACT_DIR / f"thresholds{tag}.json", "w") as fh:
             json.dump({"class_scale": scales.tolist()}, fh)
     np.save(C.ARTIFACT_DIR / f"test_probs{tag}.npy", te_p.astype(np.float32))
     np.save(C.ARTIFACT_DIR / f"test_idx{tag}.npy", te_i)
+    np.save(C.ARTIFACT_DIR / f"val_probs{tag}.npy", va_p.astype(np.float32))
+    np.save(C.ARTIFACT_DIR / f"val_idx{tag}.npy", va_i)
     with open(C.ARTIFACT_DIR / f"history{tag}.json", "w") as fh:
         json.dump({k: [float(v) for v in vs] for k, vs in history.history.items()}, fh, indent=2)
     with open(C.ARTIFACT_DIR / f"report{tag}.json", "w") as fh:

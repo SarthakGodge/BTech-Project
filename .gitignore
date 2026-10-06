@@ -1,9 +1,8 @@
 __pycache__/
 *.pyc
 artifacts/
-data/
+logs/
+results_bundle/
+results_bundle.zip
 *.npy
 *.parquet
-*.keras
-.venv/
-venv/

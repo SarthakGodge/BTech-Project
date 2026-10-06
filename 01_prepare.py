@@ -29,15 +29,30 @@ NA = ["Infinity", "-Infinity", "inf", "-inf", "NaN", "nan", ""]
 
 # ---------------------------------------------------------------- Phase A
 def read_csv(path):
-    df = pd.read_csv(path, low_memory=False, na_values=NA, encoding="latin1",
-                     usecols=lambda c: norm(c) in LOOKUP)
-    new, seen = [], set()
-    for c in df.columns:                     # rename + drop duplicate targets
+    """Chunked read: columns are parsed to float32 chunk by chunk, so a 2 GB CSV
+    never exists as a table of Python strings (that needs >10 GB of RAM)."""
+    cols = pd.read_csv(path, nrows=0, encoding="latin1").columns
+    keep, newname, seen = [], {}, set()
+    for c in cols:
+        if norm(c) not in LOOKUP:
+            continue
         canon = LOOKUP[norm(c)]
-        new.append(canon if canon not in seen else f"__dup_{c}")
+        if canon in seen:                    # duplicate target, e.g. 'Fwd Header Length.1'
+            continue
         seen.add(canon)
-    df.columns = new
-    return df.drop(columns=[c for c in df.columns if c.startswith("__dup_")])
+        keep.append(c)
+        newname[c] = canon
+    text_cols = ("Label", "Timestamp")
+    parts = []
+    for ch in pd.read_csv(path, usecols=keep, dtype=str, na_values=NA,
+                          encoding="latin1", chunksize=C.CHUNK_ROWS):
+        parts.append(pd.DataFrame({
+            newname[c]: (ch[c] if newname[c] in text_cols
+                         else pd.to_numeric(ch[c], errors="coerce").astype(np.float32))
+            for c in keep}))
+    if not parts:
+        return pd.DataFrame(columns=list(newname.values()))
+    return pd.concat(parts, ignore_index=True)
 
 
 def map_labels(s):
@@ -126,7 +141,11 @@ def phase_a():
             if not C.INCLUDE_0220 and ds == "cic2018" and "20-02" in p.name:
                 print(f"  skip {p.name} (INCLUDE_0220=False)")
                 continue
-            out = ingest(p, ds)
+            try:
+                out = ingest(p, ds)
+            except Exception as e:           # one bad file must not kill hours of work
+                print(f"  !! {p.name}: FAILED ({type(e).__name__}: {e}) - file skipped")
+                continue
             if out is not None:
                 files.append(out)
     return files
