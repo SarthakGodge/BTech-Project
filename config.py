@@ -1,109 +1,99 @@
 """
-Central configuration for the hybrid CNN+LSTM IDS pipeline.
-Edit paths here only - every script imports from this file.
+Central configuration - v2.
+
+Changes vs v1
+-------------
+* Two datasets (CIC-IDS2017 + CSE-CIC-IDS2018) harmonised to one schema.
+* Block-wise stratified split instead of a split by day (see 01_prepare.py).
+* Pre-Attack = reconnaissance/lateral-movement classes that really exist in
+  the data (Infiltration, PortScan) instead of relabelled benign flows.
+* Window label = label of the last flow.
+* Balancing strategy is chosen at train time: 05_train.py --balance ...
+
+Set the environment variable IDS_DATA_ROOT to relocate all data.
 """
+import os
 from pathlib import Path
 
-# ----------------------------------------------------------------------
-# Paths
-# ----------------------------------------------------------------------
 ROOT = Path(__file__).parent
-RAW_DIR = Path("/data/cicids2018/raw")        # where the CSVs land
-PARQUET_DIR = Path("/data/cicids2018/parquet")  # cleaned per-day parquet
-SEQ_DIR = Path("/data/cicids2018/sequences")    # windowed .npy memmaps
-ARTIFACT_DIR = ROOT / "artifacts"               # scaler, selector, model
+DATA_ROOT = Path(os.environ.get("IDS_DATA_ROOT", "/data"))
 
+# ----------------------------------------------------------------------
+# Paths. Point each dataset to the folder holding its CSVs. Use the
+# CORRECTED releases (Engelen et al. / Liu et al.) if you can get them.
+# Any CSV whose columns can be mapped is accepted; see ALIASES in common.py
+# ----------------------------------------------------------------------
+RAW_DIR = DATA_ROOT / "cicids2018" / "raw"          # kept for 00_download.sh
+DATASET_DIRS = {
+    "cic2018": RAW_DIR,
+    "cic2017": DATA_ROOT / "cicids2017" / "raw",
+}
+PARQUET_DIR = DATA_ROOT / "ids" / "parquet"
+SEQ_DIR = DATA_ROOT / "ids" / "sequences"
+ARTIFACT_DIR = ROOT / "artifacts"
 for d in (PARQUET_DIR, SEQ_DIR, ARTIFACT_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
-# ----------------------------------------------------------------------
-# Day files -> split assignment
-#
-# Chronological split. Sequences are time-ordered, so a random split would
-# leak overlapping windows between train and test. Splitting by DAY makes
-# the evaluation honest: the model is tested on traffic and attack
-# executions it has never seen.
-#
-# 02-20 is excluded by default: it is ~8 GB and carries four extra columns
-# (Flow ID, Src IP, Src Port, Dst IP) that no other file has. Set
-# INCLUDE_0220 = True to use it - 01_ingest.py normalises the schema.
-# ----------------------------------------------------------------------
-INCLUDE_0220 = False
-
-DAY_SPLITS = {
-    "Wednesday-14-02-2018": "train",   # FTP-BruteForce, SSH-Bruteforce
-    "Thursday-15-02-2018":  "train",   # DoS GoldenEye, DoS Slowloris
-    "Friday-16-02-2018":    "train",   # DoS Hulk, DoS SlowHTTPTest
-    "Thursday-20-02-2018":  "train",   # DDoS LOIC-HTTP  (large, optional)
-    "Wednesday-21-02-2018": "train",   # DDoS LOIC-UDP, DDOS HOIC
-    "Thursday-22-02-2018":  "train",   # Brute Force Web/XSS, SQL Injection
-    "Friday-23-02-2018":    "train",   # Brute Force Web/XSS, SQL Injection
-    "Wednesday-28-02-2018": "val",     # Infiltration
-    "Thursday-01-03-2018":  "test",    # Infiltration
-    "Friday-02-03-2018":    "test",    # Bot
-}
+INCLUDE_0220 = False        # skip the ~8 GB 2018 file named *20-02*
 
 # ----------------------------------------------------------------------
-# Label engineering
+# Labels. First matching rule wins (case-insensitive substring); anything
+# not matched is an Attack. Edit to taste.
 # ----------------------------------------------------------------------
 CLASS_NAMES = ["No Attack", "Pre-Attack", "Attack"]
-
-# Raw CIC-IDS2018 label strings -> base class.
-# Infilteration (their spelling) is mapped to Pre-Attack directly: those
-# scenarios capture lateral movement / probing rather than payload delivery.
-LABEL_MAP = {
-    "Benign": 0,
-    "Infilteration": 1,
-    "Infiltration": 1,
-    "Bot": 2,
-    "DoS attacks-GoldenEye": 2,
-    "DoS attacks-Slowloris": 2,
-    "DoS attacks-Hulk": 2,
-    "DoS attacks-SlowHTTPTest": 2,
-    "DDoS attacks-LOIC-HTTP": 2,
-    "DDOS attack-LOIC-UDP": 2,
-    "DDOS attack-HOIC": 2,
-    "FTP-BruteForce": 2,
-    "SSH-Bruteforce": 2,
-    "Brute Force -Web": 2,
-    "Brute Force -XSS": 2,
-    "SQL Injection": 2,
-}
-
-# Fraction of each contiguous attack episode (leading flows, in time order)
-# that gets relabelled 0 -> 1. This is the temporal Pre-Attack derivation.
-PRE_ATTACK_FRACTION = 0.12
-PRE_ATTACK_MAX_FLOWS = 500   # cap per episode so huge DDoS bursts don't dominate
-
-# Columns that must never become features: they leak identity or time
-# rather than behaviour.
-LEAK_COLUMNS = [
-    "Flow ID", "Src IP", "Src Port", "Dst IP", "Timestamp", "Label",
-    "__y", "__day",
+LABEL_RULES = [
+    ("benign", 0),
+    ("infil", 1),        # Infiltration / Infilteration  -> Pre-Attack
+    ("portscan", 1),     # CIC-IDS2017 reconnaissance    -> Pre-Attack
+    ("port scan", 1),
 ]
+LABEL_DEFAULT = 2        # DoS, DDoS, brute force, web attacks, bot, ...
+# Sub-type code stored in the parquet column __sub, so 04_sequences.py can
+# re-map PortScan without re-running ingestion (--portscan-as attack).
+SUBCODES = {"benign": 0, "infil": 1, "portscan": 2, "port scan": 2}   # other attacks = 3
+DEDUP_FLOWS = True       # drop exact duplicate flows (same features + label) per file
 
 # ----------------------------------------------------------------------
-# Feature selection / windowing
+# Split / windowing
 # ----------------------------------------------------------------------
-VARIANCE_THRESHOLD = 0.01
-K_FEATURES = 35          # matches the design figure (84 -> 35)
-WINDOW = 20              # T: flows per sequence
-STRIDE = 2               # step between window starts
+BLOCK_SIZE = 4000                    # flows per contiguous block
+SPLIT_FRACS = (0.70, 0.10, 0.20)     # train / val / test
+WINDOW = 20
+STRIDE = 2
 WINDOW_DTYPE = "float32"
+WINDOW_LABEL_MODE = "last"           # "last" | "max"
+
+# ----------------------------------------------------------------------
+# Feature selection (fit on TRAIN rows only)
+# ----------------------------------------------------------------------
+EXCLUDE_FEATURES = []                # e.g. ["Dst Port"] for cross-dataset tests
+VARIANCE_THRESHOLD = 0.01            # applied after signed-log transform
+CORR_THRESHOLD = 0.98                # drop near-duplicate features
+K_FEATURES = 35
+MI_SAMPLE_PER_CLASS = 50_000         # class-balanced sample for MI
 
 # ----------------------------------------------------------------------
 # Training
 # ----------------------------------------------------------------------
 BATCH_SIZE = 512
-EPOCHS = 50
+EPOCHS = int(os.environ.get("IDS_EPOCHS", 50))
 LEARNING_RATE = 1e-3
 SEED = 42
-
-# Focal loss (handles the 2% Pre-Attack class better than plain CE)
 FOCAL_GAMMA = 2.0
-USE_FOCAL_LOSS = True
-
-# Cap on total training windows held in memory. Set to None to use all.
-# 3M windows x 20 x 35 x 4 bytes ~= 8.4 GB, so keep this in line with
-# your instance RAM.
+USE_FOCAL_LOSS = True                # legacy flag; --loss overrides
 MAX_TRAIN_WINDOWS = 3_000_000
+MAX_EVAL_WINDOWS = 500_000
+
+# Window-level SMOTE (05_train.py --balance smote)
+SMOTE_TARGET_FRAC = 0.5      # minority classes grown to this share of the majority count
+SMOTE_SOURCE_CAP = 30_000    # real minority windows fed to SMOTE (neighbour search is O(n^2))
+SMOTE_MAJOR_CAP = 400_000    # benign windows kept in the SMOTE set (RAM)
+
+# ----------------------------------------------------------------------
+# Legacy names, kept so old scripts (06_eval.py, serve/app.py) still import
+# ----------------------------------------------------------------------
+LABEL_MAP = {}
+PRE_ATTACK_FRACTION = 0.0
+PRE_ATTACK_MAX_FLOWS = 0
+LEAK_COLUMNS = ["Flow ID", "Src IP", "Src Port", "Dst IP", "Timestamp", "Label",
+                "__y", "__blk", "__split"]

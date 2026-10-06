@@ -1,12 +1,11 @@
-pandas>=2.0
-numpy>=1.24
-pyarrow>=14.0
-scikit-learn>=1.3
-imbalanced-learn>=0.11
-tensorflow>=2.15
-matplotlib>=3.7
-seaborn>=0.13
-joblib>=1.3
-fastapi>=0.110
-uvicorn[standard]>=0.27
-pydantic>=2.5
+numpy
+pandas
+pyarrow
+scikit-learn
+imbalanced-learn
+lightgbm
+joblib
+matplotlib
+seaborn
+tabulate
+tensorflow[and-cuda]     # use "tensorflow-cpu" on machines without a GPU

@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+tensorflow-cpu
+numpy
+scikit-learn
+joblib
+pydantic
